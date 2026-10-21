@@ -1,0 +1,8 @@
+{
+  "default": {},
+  "programs": {
+    "obs": {"never_touch": true},
+    "zoom.us": {"class": "interactive"},
+    "python:spike.py": {"class": "background"}
+  }
+}

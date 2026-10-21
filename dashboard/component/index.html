@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body, #root { width:100%; height:100%; margin:0; overflow:hidden; }
+    #app { display:block; width:100%; height:100%; border:0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    let appFrame = null;
+    let latestTelemetry = null;
+
+    function sendTelemetry() {
+      if (appFrame && appFrame.dataset.ready === 'true' && latestTelemetry) {
+        appFrame.contentWindow.postMessage({ type:'rg:telemetry', data:latestTelemetry }, '*');
+      }
+    }
+
+    window.addEventListener('message', event => {
+      const message = event.data || {};
+      if (message.type === 'streamlit:render') {
+        const args = message.args || {};
+        if (!appFrame) {
+          appFrame = document.createElement('iframe');
+          appFrame.id = 'app';
+          appFrame.title = 'Resource Governor dashboard';
+          document.querySelector('#root').appendChild(appFrame);
+        }
+        if (!appFrame.dataset.loaded) {
+          appFrame.src = 'page.html';
+          appFrame.dataset.loaded = 'true';
+        }
+        latestTelemetry = args.live_data || null;
+        sendTelemetry();
+        window.parent.postMessage({ isStreamlitMessage:true, type:'streamlit:setFrameHeight', height:window.innerHeight }, '*');
+      } else if (message.type === 'rg:ready' && appFrame && event.source === appFrame.contentWindow) {
+        appFrame.dataset.ready = 'true';
+        sendTelemetry();
+      }
+    });
+
+    window.parent.postMessage({ isStreamlitMessage:true, type:'streamlit:componentReady', apiVersion:1 }, '*');
+  </script>
+</body>
+</html>
