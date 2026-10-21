@@ -125,7 +125,7 @@ def live_data():
     if top_keys:
         placeholders = ','.join('?' for _ in top_keys)
         grouped = query(
-            'SELECT CAST(ts / 5 AS INTEGER) * 5 AS bucket, key, AVG(cpu) AS cpu '
+            'SELECT CAST(ts / 5 AS INTEGER) * 5 AS bucket, key, MAX(cpu) AS cpu '
             f'FROM samples WHERE ts >= ? AND key IN ({placeholders}) '
             'GROUP BY bucket, key ORDER BY bucket',
             (since, *top_keys),
@@ -137,13 +137,26 @@ def live_data():
                 }})
 
     q_timeline = []
-    if not queue_events.empty:
-        changes = queue_events[queue_events.ts >= since].copy()
+    changes = queue_events[queue_events.ts >= since].copy()
+    if changes.empty and not current.empty:
+        active = current.sort_values('cpu', ascending=False).head(5)
+        q_timeline = [{'t': since, 'proc': f'{row.key} #{int(row.pid)}', 'level': int(row.queue)}
+                      for row in active.itertuples()]
+    elif not changes.empty:
         changes['proc'] = changes.key.astype(str) + ' #' + changes.pid.astype(str)
         counts = changes.proc.value_counts()
         chosen = set(counts.head(5).index)
         changes = changes[changes.proc.isin(chosen)].sort_values('ts')
-        q_timeline = [{'t': safe_num(r.ts), 'proc': str(r.proc), 'level': int(r.level)} for r in changes.itertuples()]
+        process_ids = changes.pid.unique()
+        prior = queue_events[(queue_events.ts < since) & queue_events.pid.isin(process_ids)].copy()
+        if not prior.empty:
+            prior = prior.sort_values('ts').groupby('pid').tail(1)
+            prior['ts'] = since
+            prior['proc'] = prior.key.astype(str) + ' #' + prior.pid.astype(str)
+            prior = prior[prior.proc.isin(chosen)]
+        timeline = pd.concat([prior, changes]).sort_values('ts')
+        q_timeline = [{'t': safe_num(r.ts), 'proc': str(r.proc), 'level': int(r.level)}
+                      for r in timeline.itertuples()]
 
     overhead = []
     if not meta.empty:
