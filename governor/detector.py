@@ -17,6 +17,7 @@ class ProcState:
         self.deferred = False
         self.cpu_before = 0.0
         self.verify_at = 0.0
+        self.suspect_checked = False
         self.base = 0
         self.classed = False
         self.level_since = 0.0

@@ -1,11 +1,13 @@
 import argparse, os, time
 import psutil
-from governor import config as cfg, store, actuator, notify, leak
+from governor import config as cfg, store, actuator, notify, leak, suspect
 from governor.context import Foreground
 from governor.detector import Detector, ProcState
+from governor.family import Family
+from governor.feedback import Learner
 from governor.policy import Policy
 
-NOTIFY = {'throttle_L1', 'throttle_L2', 'leak_warning', 'verify_ineffective'}
+NOTIFY = {'throttle_L1', 'throttle_L2', 'leak_warning', 'verify_ineffective', 'suspicious'}
 
 def proc_key(p):
     name = (p.name() or '?').lower()
@@ -26,7 +28,7 @@ def handle(p, st, cpu, mem, now, c):
     pol = c['policy']
     if pol.get(key, 'never_touch', False):
         return
-    zt = pol.get(key, 'z_threshold', cfg.Z_THRESHOLD) * (0.8 if c['battery'] else 1.0)
+    zt = pol.get(key, 'z_threshold', cfg.Z_THRESHOLD) * (0.8 if c['battery'] else 1.0) + c['learn'].bonus_for(key)
     cls = cfg.CLASSES.get(pol.get(key, 'class', 'normal'), cfg.CLASSES['normal'])
     max_level = pol.get(key, 'max_level', cls['max'])
     if not st.classed:
@@ -85,6 +87,12 @@ def handle(p, st, cpu, mem, now, c):
         ev.append((now, pid, key, 'cpu', cpu, zs['cpu'], 'verify_' + outcome, None, None,
                    'cpu %.0f%% to %.0f%%, system load %.0f%%' % (st.cpu_before, cpu, c['sysload'])))
 
+        if st.level and not st.suspect_checked:
+         st.suspect_checked = True
+         pts, why = suspect.score(p, cpu, c['fg'])
+         if pts >= cfg.SUSPECT_SCORE:
+            ev.append((now, pid, key, 'cpu', cpu, zs['cpu'], 'suspicious', None, None,
+                       'score %d: %s' % (pts, '; '.join(why))))
     st.hist.append((now, mem))
     st.tick += 1
     if st.tick % 10 == 0 and len(st.hist) == st.hist.maxlen and not st.leak_flag:
@@ -131,6 +139,7 @@ def main():
     store.init()
     con = store.connect()
     det, states, fg, policy = Detector(), {}, Foreground(), Policy()
+    fam, learn = Family(), Learner()
     det.load(cfg.BASELINE_PATH)
     me = psutil.Process(os.getpid())
     me.cpu_percent(None)
@@ -144,11 +153,12 @@ def main():
             cycle += 1
             if cycle % 10 == 0:
                 policy.reload()
+                learn.poll()
             if cycle % 300 == 0:
                 det.save(cfg.BASELINE_PATH)
-            samples, events, seen = [], [], set()
+            samples, events, seen, groups = [], [], set(), {}
             batt = psutil.sensors_battery() if (cfg.BATTERY_AWARE and hasattr(psutil, 'sensors_battery')) else None
-            c = {'det': det, 'policy': policy, 'events': events, 'samples': samples,
+            c = {'learn': learn, 'det': det, 'policy': policy, 'events': events, 'samples': samples,
                  'fg': fg.pids(t0) if cfg.PROTECT_FOREGROUND else set(),
                  'battery': bool(batt and batt.power_plugged is False),
                  'sysload': psutil.cpu_percent(None),
@@ -166,10 +176,13 @@ def main():
                         mem = p.memory_info().rss / 1048576
                     if pid == me.pid or st.key in cfg.PROTECTED:
                         continue
+                    if not policy.get(st.key, 'never_touch', False):
+                        groups.setdefault(st.key, []).append((cpu, mem, p, st))
                     handle(p, st, cpu, mem, t0, c)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
             states = {k: v for k, v in states.items() if k in seen}
+            fam.check(t0, groups, det, events, c['fg'])
             ts = time.time()
             meta = (ts, me.cpu_percent(None), me.memory_info().rss / 1048576, (ts - t0) * 1000, len(seen))
             store.write(con, samples, events, meta)

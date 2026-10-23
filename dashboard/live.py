@@ -5,6 +5,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from governor import config as cfg
+from governor import feedback
 
 st.set_page_config(page_title='Resource Governor: live', layout='wide')
 st.title('Resource Governor: live')
@@ -105,6 +106,18 @@ def live():
     if not m.empty:
         st.subheader('Governor overhead')
         st.line_chart(m.set_index('time')[['gov_cpu', 'cycle_ms']])
-
+        st.subheader('Teach the governor')
+    recent = w[w.action.str.startswith('throttle_L')].sort_values('ts', ascending=False).drop_duplicates('key').head(6)
+    if recent.empty:
+        st.caption('Interventions will appear here for you to review.')
+    for _, r in recent.iterrows():
+        col1, col2, col3 = st.columns([3, 1, 1])
+        col1.write('%s at %s, CPU %.0f%%' % (r.key, r.time.strftime('%H:%M:%S'), r.value))
+        if col2.button('False alarm', key='fa%s' % r.ts):
+            feedback.submit(r.key, 'false_alarm')
+            st.toast('Noted. %s will be judged less strictly.' % r.key)
+        if col3.button('Real issue', key='ri%s' % r.ts):
+            feedback.submit(r.key, 'real_issue')
+            st.toast('Noted. %s will be judged more strictly.' % r.key)
 
 live()
