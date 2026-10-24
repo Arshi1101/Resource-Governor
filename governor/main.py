@@ -32,15 +32,20 @@ def handle(p, st, cpu, mem, now, c):
     cls = cfg.CLASSES.get(pol.get(key, 'class', 'normal'), cfg.CLASSES['normal'])
     max_level = pol.get(key, 'max_level', cls['max'])
     if not st.classed:
-        st.classed, st.base, st.level_since = True, cls['base'], now
-        if st.base > 0:
+        st.classed, st.level_since = True, now
+        requested_base = cls['base']
+        if st.level < requested_base:
             try:
-                old, new = actuator.move(p, st.base)
-                st.orig, st.level = old, st.base
+                old, new = actuator.move(p, requested_base)
+                st.orig, st.level, st.base = old, requested_base, requested_base
                 ev.append((now, pid, key, 'cpu', cpu, 0.0, 'class_set', old, new,
-                           'class %s, queue Q%d' % (pol.get(key, 'class', 'normal'), st.base)))
+                           'class %s, queue Q%d' % (pol.get(key, 'class', 'normal'), requested_base)))
             except (psutil.AccessDenied, PermissionError):
-                st.base = 0
+                st.base = st.level
+        else:
+            st.base = st.level
+            ev.append((now, pid, key, 'cpu', cpu, 0.0, 'queue_state', st.orig, st.orig,
+                       'current OS priority, queue Q%d' % st.level))
 
     for metric, x in (('cpu', cpu), ('mem', mem)):
         bad, z = c['det'].evaluate(key, metric, x, zt)
@@ -171,7 +176,14 @@ def main():
                         cpu = p.cpu_percent(None)
                         st = states.get(pid)
                         if st is None:
-                            states[pid] = ProcState(proc_key(p))
+                            st = ProcState(proc_key(p))
+                            try:
+                                st.orig = p.nice()
+                                st.level = actuator.level_for_priority(st.orig)
+                                st.base = st.level
+                            except (psutil.Error, PermissionError):
+                                pass
+                            states[pid] = st
                             continue
                         mem = p.memory_info().rss / 1048576
                     if pid == me.pid or st.key in cfg.PROTECTED:

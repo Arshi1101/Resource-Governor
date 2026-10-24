@@ -6,12 +6,13 @@ import time
 from datetime import datetime
 
 import pandas as pd
+import psutil
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from governor import config as cfg
+from governor import actuator, config as cfg
 
 
 def make_icon():
@@ -44,6 +45,7 @@ iframe { width: 100% !important; height: 100vh !important; border: 0 !important;
 TZ = datetime.now().astimezone().tzinfo
 LIVE_WINDOW_MINUTES = 10
 LIVE_REFRESH_SECONDS = 5
+QUEUE_DISPLAY_LIMIT = 30
 QNAME = {0: 'Q0 · Normal', 1: 'Q1 · Reduced', 2: 'Q2 · Lowest'}
 
 
@@ -89,8 +91,9 @@ def live_data():
     meta = query('SELECT ts, gov_cpu, gov_rss_mb, cycle_ms FROM meta WHERE ts >= ?', (since,))
     events = query('SELECT ts, pid, key, action, note FROM events WHERE ts >= ? ORDER BY ts', (since,))
     queue_events = query(
-        'SELECT ts, pid, key, action, note FROM events WHERE ts >= ? ORDER BY ts',
-        (now - 86400,),
+        "SELECT ts, pid, key, action, note FROM events "
+        "WHERE action IN ('queue_state', 'class_set', 'throttle_L1', 'throttle_L2', 'promote', 'boost') "
+        'ORDER BY ts'
     )
     event_cols = ['ts', 'pid', 'key', 'action', 'note', 'time']
     if events.empty:
@@ -104,20 +107,37 @@ def live_data():
 
     latest_queue = {}
     if not queue_events.empty:
-        latest_queue = queue_events.sort_values('ts').groupby('pid').tail(1).set_index('pid').level.to_dict()
+        latest = queue_events.sort_values('ts').groupby(['pid', 'key']).tail(1)
+        latest_queue = {
+            (int(row.pid), str(row.key)): int(row.level)
+            for row in latest.itertuples() if pd.notna(row.level)
+        }
     current = pd.DataFrame()
     if not samples.empty:
         current = samples[samples.ts >= now - 15].sort_values('ts').drop_duplicates('pid', keep='last').copy()
         if not current.empty:
-            current['queue'] = current.pid.map(latest_queue).fillna(0).astype(int)
+            def live_queue(pid, key):
+                try:
+                    return actuator.level_for_priority(psutil.Process(int(pid)).nice())
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    return None
+                except (psutil.Error, PermissionError):
+                    return latest_queue.get((int(pid), str(key)), 0)
+
+            current['queue'] = [live_queue(row.pid, row.key) for row in current.itertuples()]
+            current = current[current.queue.notna()].copy()
+            current['queue'] = current.queue.astype(int)
 
     recent_moves = window_events[window_events.level.notna() | window_events.action.astype(str).str.startswith('verify_')].copy()
     recent_moves = recent_moves.sort_values('ts', ascending=False).head(40)
+    queue_counts = {level: int((current.queue == level).sum()) if not current.empty else 0
+                    for level in range(3)}
+    displayed = current.sort_values('cpu', ascending=False).head(QUEUE_DISPLAY_LIMIT) if not current.empty else current
     queues = []
     for level in range(3):
-        group = current[current.queue == level].sort_values('cpu', ascending=False) if not current.empty else current
+        group = displayed[displayed.queue == level].sort_values('cpu', ascending=False) if not displayed.empty else displayed
         queues.append([{'program': str(row.key), 'pid': int(row.pid), 'cpu': safe_num(row.cpu, 1)}
-                       for row in group.head(12).itertuples()])
+                       for row in group.itertuples()])
 
     top = query('SELECT key, MAX(cpu) AS peak FROM samples WHERE ts >= ? GROUP BY key ORDER BY peak DESC LIMIT 4', (since,))
     top_keys = top.key.astype(str).tolist() if not top.empty else []
@@ -137,26 +157,19 @@ def live_data():
                 }})
 
     q_timeline = []
-    changes = queue_events[queue_events.ts >= since].copy()
-    if changes.empty and not current.empty:
+    if not current.empty:
         active = current.sort_values('cpu', ascending=False).head(5)
-        q_timeline = [{'t': since, 'proc': f'{row.key} #{int(row.pid)}', 'level': int(row.queue)}
-                      for row in active.itertuples()]
-    elif not changes.empty:
-        changes['proc'] = changes.key.astype(str) + ' #' + changes.pid.astype(str)
-        counts = changes.proc.value_counts()
-        chosen = set(counts.head(5).index)
-        changes = changes[changes.proc.isin(chosen)].sort_values('ts')
-        process_ids = changes.pid.unique()
-        prior = queue_events[(queue_events.ts < since) & queue_events.pid.isin(process_ids)].copy()
-        if not prior.empty:
-            prior = prior.sort_values('ts').groupby('pid').tail(1)
-            prior['ts'] = since
-            prior['proc'] = prior.key.astype(str) + ' #' + prior.pid.astype(str)
-            prior = prior[prior.proc.isin(chosen)]
-        timeline = pd.concat([prior, changes]).sort_values('ts')
-        q_timeline = [{'t': safe_num(r.ts), 'proc': str(r.proc), 'level': int(r.level)}
-                      for r in timeline.itertuples()]
+        for row in active.itertuples():
+            process_events = queue_events[(queue_events.pid == row.pid) & (queue_events.key == row.key)]
+            before = process_events[process_events.ts < since].sort_values('ts').tail(1)
+            changes = process_events[process_events.ts >= since].sort_values('ts')
+            proc = f'{row.key} #{int(row.pid)}'
+            if not before.empty:
+                q_timeline.append({'t': since, 'proc': proc, 'level': int(before.iloc[-1].level)})
+            elif changes.empty:
+                q_timeline.append({'t': since, 'proc': proc, 'level': int(row.queue)})
+            for change in changes.itertuples():
+                q_timeline.append({'t': safe_num(change.ts), 'proc': proc, 'level': int(change.level)})
 
     overhead = []
     if not meta.empty:
@@ -185,6 +198,9 @@ def live_data():
             'cycle': safe_num(meta.cycle_ms.mean(), 1) if not meta.empty else None,
         },
         'queues': queues,
+        'queue_counts': queue_counts,
+        'queue_total': int(len(current)),
+        'queue_shown': int(len(displayed)),
         'queue_timeline': q_timeline,
         'moves': [move_record(row) for row in recent_moves.itertuples()],
         'top_keys': top_keys,

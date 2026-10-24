@@ -10,6 +10,19 @@ def ladder():
                 psutil.IDLE_PRIORITY_CLASS]
     return cfg.LADDER_MAC
 
+def level_for_priority(priority):
+    levels = ladder()
+    try:
+        return levels.index(priority)
+    except ValueError:
+        if IS_WIN or not isinstance(priority, (int, float)):
+            return 0
+        if priority <= levels[0]:
+            return 0
+        if priority <= levels[1]:
+            return 1
+        return 2
+
 def move(p, level):
     old = p.nice()
     new = ladder()[level]
