@@ -190,7 +190,7 @@ Available program fields include `never_touch`, `class`, `max_level`, and `z_thr
 
 In adaptive mode, the default warm-up is 60 observations. By default, an anomaly must persist for 10 samples; CPU demotions are separated by a cooldown. Static mode uses the fixed CPU and memory thresholds in `governor/config.py`. CPU priority changes do not reduce memory use. On macOS, changing priority for another user's process or restoring a higher priority can require elevated permissions. On Windows, managing processes owned by other users can require Administrator privileges.
 
-The primary dashboard displays up to 30 active sampled processes, ranked by CPU across all queues. Its queue timeline plots the five busiest active sampled processes and uses recorded queue transitions when available. Processes that have not produced a sample in the current live window may not appear in the “right now” list.
+The primary dashboard shows all active Q1 processes. Q0 and Q2 share a 30-process display limit, ranked by CPU; the UI reports displayed and active counts. Its queue timeline uses a shorter, three-minute window and plots up to five active sampled processes, including a representative from each occupied queue. Recorded queue transitions are used when available. Processes that have not produced a sample in the current live window may not appear in the “right now” list.
 
 ## Troubleshooting
 

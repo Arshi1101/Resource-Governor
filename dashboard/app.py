@@ -44,6 +44,7 @@ iframe { width: 100% !important; height: 100vh !important; border: 0 !important;
 
 TZ = datetime.now().astimezone().tzinfo
 LIVE_WINDOW_MINUTES = 10
+QUEUE_WINDOW_MINUTES = 3
 LIVE_REFRESH_SECONDS = 5
 QUEUE_DISPLAY_LIMIT = 30
 QNAME = {0: 'Q0 · Normal', 1: 'Q1 · Reduced', 2: 'Q2 · Lowest'}
@@ -87,6 +88,7 @@ def safe_num(value, digits=None):
 def live_data():
     now = time.time()
     since = now - LIVE_WINDOW_MINUTES * 60
+    queue_since = now - QUEUE_WINDOW_MINUTES * 60
     samples = query('SELECT ts, pid, key, cpu FROM samples WHERE ts >= ?', (now - 15,))
     meta = query('SELECT ts, gov_cpu, gov_rss_mb, cycle_ms FROM meta WHERE ts >= ?', (since,))
     events = query('SELECT ts, pid, key, action, note FROM events WHERE ts >= ? ORDER BY ts', (since,))
@@ -128,14 +130,19 @@ def live_data():
             current = current[current.queue.notna()].copy()
             current['queue'] = current.queue.astype(int)
 
-    recent_moves = window_events[window_events.level.notna() | window_events.action.astype(str).str.startswith('verify_')].copy()
+    action_names = window_events.action.astype(str)
+    relevant = (action_names.str.startswith(('throttle_L', 'verify_'))
+                | action_names.isin({'class_set', 'promote', 'boost', 'deferred_foreground'})
+                | action_names.str.endswith('_failed'))
+    recent_moves = window_events[relevant].copy()
     recent_moves = recent_moves.sort_values('ts', ascending=False).head(40)
     queue_counts = {level: int((current.queue == level).sum()) if not current.empty else 0
                     for level in range(3)}
     displayed = current.sort_values('cpu', ascending=False).head(QUEUE_DISPLAY_LIMIT) if not current.empty else current
     queues = []
     for level in range(3):
-        group = displayed[displayed.queue == level].sort_values('cpu', ascending=False) if not displayed.empty else displayed
+        source = current if level == 1 else displayed
+        group = source[source.queue == level].sort_values('cpu', ascending=False) if not source.empty else source
         queues.append([{'program': str(row.key), 'pid': int(row.pid), 'cpu': safe_num(row.cpu, 1)}
                        for row in group.itertuples()])
 
@@ -158,18 +165,36 @@ def live_data():
 
     q_timeline = []
     if not current.empty:
-        active = current.sort_values('cpu', ascending=False).head(5)
-        for row in active.itertuples():
+        ordered = current.sort_values('cpu', ascending=False)
+        active = []
+        selected_pids = set()
+        for level in range(3):
+            group = ordered[ordered.queue == level]
+            if not group.empty:
+                row = next(group.itertuples())
+                active.append(row)
+                selected_pids.add(int(row.pid))
+        for row in ordered.itertuples():
+            if int(row.pid) not in selected_pids:
+                active.append(row)
+                selected_pids.add(int(row.pid))
+            if len(active) >= 5:
+                break
+        for row in active:
             process_events = queue_events[(queue_events.pid == row.pid) & (queue_events.key == row.key)]
-            before = process_events[process_events.ts < since].sort_values('ts').tail(1)
-            changes = process_events[process_events.ts >= since].sort_values('ts')
+            before = process_events[process_events.ts < queue_since].sort_values('ts').tail(1)
+            changes = process_events[process_events.ts >= queue_since].sort_values('ts')
             proc = f'{row.key} #{int(row.pid)}'
             if not before.empty:
-                q_timeline.append({'t': since, 'proc': proc, 'level': int(before.iloc[-1].level)})
+                q_timeline.append({'t': queue_since, 'proc': proc, 'level': int(before.iloc[-1].level)})
             elif changes.empty:
-                q_timeline.append({'t': since, 'proc': proc, 'level': int(row.queue)})
+                q_timeline.append({'t': queue_since, 'proc': proc, 'level': int(row.queue)})
             for change in changes.itertuples():
                 q_timeline.append({'t': safe_num(change.ts), 'proc': proc, 'level': int(change.level)})
+            known_level = int(changes.iloc[-1].level) if not changes.empty else (
+                int(before.iloc[-1].level) if not before.empty else int(row.queue))
+            if known_level != int(row.queue):
+                q_timeline.append({'t': now, 'proc': proc, 'level': int(row.queue)})
 
     overhead = []
     if not meta.empty:
@@ -187,6 +212,7 @@ def live_data():
     demotions = int(window_events.action.astype(str).str.startswith('throttle_L').sum()) if not window_events.empty else 0
     return {
         'now': now, 'since': since, 'window': LIVE_WINDOW_MINUTES,
+        'queue_since': queue_since, 'queue_window': QUEUE_WINDOW_MINUTES,
         'samples': int(len(samples)), 'latest_sample': safe_num(samples.ts.max()) if not samples.empty else None,
         'metrics': {
             'demotions': demotions,
@@ -200,9 +226,10 @@ def live_data():
         'queues': queues,
         'queue_counts': queue_counts,
         'queue_total': int(len(current)),
-        'queue_shown': int(len(displayed)),
+        'queue_shown': int(sum(len(queue) for queue in queues)),
         'queue_timeline': q_timeline,
         'moves': [move_record(row) for row in recent_moves.itertuples()],
+        'interventions': int(len(recent_moves)),
         'top_keys': top_keys,
         'cpu_series': cpu_series,
         'overhead': overhead,
